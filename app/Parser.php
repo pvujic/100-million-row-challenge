@@ -17,7 +17,6 @@ use function fgets;
 use function fwrite;
 use function filesize;
 use function gc_disable;
-use function proc_nice;
 use function pcntl_fork;
 use function pcntl_wait;
 use function pack;
@@ -115,18 +114,6 @@ final class Parser
         fclose($fh);
         $boundaries[] = $fileSize;
 
-        // Pre-warm file cache at chunk boundaries
-        $fh = fopen($inputPath, 'rb');
-        for ($i = 0; $i <= self::WORKERS; $i++) {
-            fseek($fh, $boundaries[$i]);
-            fread($fh, 4096);
-        }
-        fclose($fh);
-
-        $oldHandler = set_error_handler(function() { return true; });
-        proc_nice(-20);
-        set_error_handler($oldHandler);
-
         // Fork WORKERS-1 children for chunks 0..WORKERS-2
         $tmpDir = sys_get_temp_dir();
         $myPid = getmypid();
@@ -202,29 +189,33 @@ final class Parser
             $fence = $lastNl - 600;
 
             while ($p < $fence) {
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
 
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
 
             while ($p < $lastNl) {
-                $sep = strpos($chunk, ',', $p + 4);
+                $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
             }
