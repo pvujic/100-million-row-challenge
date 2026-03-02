@@ -3,21 +3,9 @@
 
 if (($argv[1] ?? null) === 'data:parse') {
     gc_disable();
-    $input = null;
-    $output = null;
-    foreach ($argv as $arg) {
-        if (str_starts_with($arg, '--inputPath=')) $input = substr($arg, 12);
-        if (str_starts_with($arg, '--outputPath=')) $output = substr($arg, 13);
-        if (str_starts_with($arg, '--input-path=')) $input = substr($arg, 13);
-        if (str_starts_with($arg, '--output-path=')) $output = substr($arg, 14);
-    }
-    if (!$input || !$output) {
-        fwrite(STDERR, "Usage: php tempest data:parse --inputPath=... --outputPath=...\n");
-        exit(1);
-    }
     require __DIR__ . '/app/Commands/Visit.php';
     require __DIR__ . '/app/Parser.php';
-    \App\Parser::parse($input, $output);
+    \App\Parser::parse(substr($argv[2], 13), substr($argv[3], 14));
     exit(0);
 }
 
