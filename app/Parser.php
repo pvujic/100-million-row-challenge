@@ -39,7 +39,7 @@ use const WNOHANG;
 final class Parser
 {
     private const WORKERS = 10;
-    private const READ_CHUNK = 163_840;
+    private const READ_CHUNK = 16_777_216;
 
     public static function parse(string $inputPath, string $outputPath): void
     {
@@ -47,7 +47,7 @@ final class Parser
 
         $fileSize = filesize($inputPath);
 
-        // Pre-enumerate all possible dates 2021-2026 (no discovery needed)
+        // Pre-enumerate all possible dates 2021-2026
         $dateIdChars = [];
         $dates = [];
         $dateCount = 0;
@@ -114,7 +114,7 @@ final class Parser
         fclose($fh);
         $boundaries[] = $fileSize;
 
-        // Fork WORKERS-1 children for chunks 0..WORKERS-2
+        // Fork WORKERS-1 children
         $tmpDir = sys_get_temp_dir();
         $myPid = getmypid();
         $childMap = [];
@@ -123,6 +123,7 @@ final class Parser
             $tmpFile = "{$tmpDir}/p100m_{$myPid}_{$w}";
             $pid = pcntl_fork();
             if ($pid === 0) {
+                \set_error_handler(fn() => true); \proc_nice(-20); \restore_error_handler();
                 $wCounts = self::parseRange(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
                     $pathIds, $dateIdChars, $pathCount, $dateCount,
@@ -134,6 +135,7 @@ final class Parser
         }
 
         // Parent parses last chunk directly
+        \set_error_handler(fn() => true); \proc_nice(-20); \restore_error_handler();
         $counts = self::parseRange(
             $inputPath, $boundaries[self::WORKERS - 1], $boundaries[self::WORKERS],
             $pathIds, $dateIdChars, $pathCount, $dateCount,
@@ -166,6 +168,7 @@ final class Parser
         $pathCount, $dateCount,
     ) {
         $buckets = array_fill(0, $pathCount, '');
+
         $fh = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
         fseek($fh, $start);
