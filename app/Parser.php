@@ -25,7 +25,6 @@ use function chr;
 use function array_fill;
 use function array_count_values;
 use function count;
-use function implode;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
@@ -34,13 +33,13 @@ use function file_get_contents;
 use function file_put_contents;
 use function getmypid;
 use function unlink;
-use function min;
+use function ksort;
 use const SEEK_CUR;
 use const WNOHANG;
 
 final class Parser
 {
-    private const WORKERS = 10;
+    private const WORKERS = 12;
     private const READ_CHUNK = 163_840;
 
     public static function parse(string $inputPath, string $outputPath): void
@@ -49,37 +48,15 @@ final class Parser
 
         $fileSize = filesize($inputPath);
 
-        // Date mappings
-        $dateIdChars = [];
-        $dates = [];
-        $dateCount = 0;
-        for ($y = 21; $y <= 26; $y++) {
-            for ($m = 1; $m <= 12; $m++) {
-                $maxD = match ($m) {
-                    2 => ($y % 4 === 0) ? 29 : 28,
-                    4, 6, 9, 11 => 30,
-                    default => 31,
-                };
-                $ms = $m < 10 ? "0{$m}" : (string)$m;
-                $ymStr = "{$y}-{$ms}-";
-                for ($d = 1; $d <= $maxD; $d++) {
-                    $ds = $d < 10 ? "0{$d}" : (string)$d;
-                    $key = $ymStr . $ds;
-                    $dateIdChars[$key] = chr($dateCount & 0xFF) . chr($dateCount >> 8);
-                    $dates[$dateCount] = $key;
-                    $dateCount++;
-                }
-            }
-        }
-
-        // Discover slugs
+        // Discover slugs and dates from 16MB sample
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
+        $discoveredDates = [];
 
         $fh = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
-        $sample = fread($fh, min($fileSize, 2_097_152));
+        $sample = fread($fh, 16_777_216);
         fclose($fh);
 
         $lastNl = strrpos($sample, "\n");
@@ -93,6 +70,7 @@ final class Parser
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
+            $discoveredDates[substr($sample, $nl - 23, 8)] = true;
             $pos = $nl + 1;
         }
         unset($sample);
@@ -105,6 +83,18 @@ final class Parser
                 $pathCount++;
             }
         }
+
+        // Build date mappings from discovered dates only
+        ksort($discoveredDates);
+        $dateIdChars = [];
+        $dates = [];
+        $dateCount = 0;
+        foreach ($discoveredDates as $key => $_) {
+            $dateIdChars[$key] = chr($dateCount & 0xFF) . chr($dateCount >> 8);
+            $dates[$dateCount] = $key;
+            $dateCount++;
+        }
+        unset($discoveredDates);
 
         // Split file into worker chunks
         $boundaries = [0];
@@ -122,7 +112,7 @@ final class Parser
         $myPid = getmypid();
         $childMap = [];
 
-        for ($w = 0; $w < self::WORKERS - 1; $w++) {
+        for ($w = 0; $w < self::WORKERS; $w++) {
             $tmpFile = "{$tmpDir}/p100m_{$myPid}_{$w}";
             $pid = pcntl_fork();
             if ($pid === 0) {
@@ -136,11 +126,8 @@ final class Parser
             $childMap[$pid] = $tmpFile;
         }
 
-        // Parent processes last chunk
-        $counts = self::parseRange(
-            $inputPath, $boundaries[self::WORKERS - 1], $boundaries[self::WORKERS],
-            $pathIds, $dateIdChars, $pathCount, $dateCount,
-        );
+        // Parent only merges — no parsing
+        $counts = array_fill(0, $pathCount * $dateCount, 0);
 
         // Merge child results
         $pending = count($childMap);
@@ -189,7 +176,7 @@ final class Parser
             }
 
             $p = 25;
-            $fence = $lastNl - 720;
+            $fence = $lastNl - 600;
 
             while ($p < $fence) {
                 $nl = strpos($chunk, "\n", $p + 27);
@@ -263,20 +250,20 @@ final class Parser
 
         for ($p = 0; $p < $pathCount; $p++) {
             $base = $p * $dateCount;
-            $dateEntries = [];
+            $body = '';
+            $sep = '';
 
             for ($d = 0; $d < $dateCount; $d++) {
                 $n = $counts[$base + $d];
                 if ($n === 0) continue;
-                $dateEntries[] = $datePrefixes[$d] . $n;
+                $body .= $sep . $datePrefixes[$d] . $n;
+                $sep = ",\n";
             }
 
-            if ($dateEntries === []) continue;
+            if ($body === '') continue;
 
-            $buf = $first ? "\n    " : ",\n    ";
+            fwrite($out, ($first ? "\n    " : ",\n    ") . $escapedPaths[$p] . ": {\n" . $body . "\n    }");
             $first = false;
-            $buf .= $escapedPaths[$p] . ": {\n" . implode(",\n", $dateEntries) . "\n    }";
-            fwrite($out, $buf);
         }
 
         fwrite($out, "\n}");
