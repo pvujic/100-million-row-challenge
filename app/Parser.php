@@ -2,8 +2,6 @@
 
 namespace App;
 
-use App\Commands\Visit;
-
 use function strpos;
 use function strrpos;
 use function substr;
@@ -18,7 +16,6 @@ use function fwrite;
 use function filesize;
 use function gc_disable;
 use function pcntl_fork;
-use function pcntl_wait;
 use function pack;
 use function unpack;
 use function chr;
@@ -28,26 +25,17 @@ use function count;
 use function str_replace;
 use function stream_set_read_buffer;
 use function stream_set_write_buffer;
-use function sys_get_temp_dir;
-use function file_get_contents;
-use function file_put_contents;
-use function getmypid;
-use function unlink;
-use function sem_get;
-use function sem_acquire;
-use function sem_release;
-use function sem_remove;
-use function shmop_open;
-use function shmop_read;
-use function shmop_write;
-use function shmop_delete;
+use function stream_set_chunk_size;
+use function stream_socket_pair;
+use function stream_select;
 use const SEEK_CUR;
-use const WNOHANG;
+use const STREAM_PF_UNIX;
+use const STREAM_SOCK_STREAM;
+use const STREAM_IPPROTO_IP;
 
 final class Parser
 {
-    private const WORKERS = 8;
-    private const NUM_CHUNKS = 16;
+    private const WORKERS = 10;
     private const READ_CHUNK = 163_840;
 
     public static function parse(string $inputPath, string $outputPath): void
@@ -78,7 +66,7 @@ final class Parser
             }
         }
 
-        // Discover slugs from 2MB sample
+        // Discover slugs from 2MB sample (comma-based)
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
@@ -89,123 +77,141 @@ final class Parser
         fclose($fh);
 
         $lastNl = strrpos($sample, "\n");
-        $pos = 0;
-        while ($pos < $lastNl) {
-            $nlPos = strpos($sample, "\n", $pos + 52);
-            if ($nlPos === false) break;
-            $slug = substr($sample, $pos + 25, $nlPos - $pos - 51);
+        $p = 25;
+        while ($p < $lastNl) {
+            $sep = strpos($sample, ',', $p);
+            if ($sep === false) break;
+            $slug = substr($sample, $p, $sep - $p);
             if (!isset($pathIds[$slug])) {
                 $pathIds[$slug] = $pathCount;
                 $paths[$pathCount] = $slug;
                 $pathCount++;
             }
-            $pos = $nlPos + 1;
+            $p = $sep + 52;
         }
         unset($sample);
 
-        foreach (Visit::all() as $visit) {
-            $slug = substr($visit->uri, 25);
-            if (!isset($pathIds[$slug])) {
-                $pathIds[$slug] = $pathCount;
-                $paths[$pathCount] = $slug;
-                $pathCount++;
-            }
-        }
+        $cellTotal = $pathCount * $dateCount;
+        $packedSize = $cellTotal * 2;
 
-        // Split file into NUM_CHUNKS chunks
+        // Split file into WORKERS chunks (fixed assignment)
         $boundaries = [0];
         $fh = fopen($inputPath, 'rb');
-        for ($i = 1; $i < self::NUM_CHUNKS; $i++) {
-            fseek($fh, (int)($fileSize * $i / self::NUM_CHUNKS));
+        for ($i = 1; $i < self::WORKERS; $i++) {
+            fseek($fh, (int)($fileSize * $i / self::WORKERS));
             fgets($fh);
             $boundaries[] = ftell($fh);
         }
         fclose($fh);
         $boundaries[] = $fileSize;
 
-        // Work-stealing queue via shmop + semaphore
-        $myPid = getmypid();
-        $sem = sem_get($myPid + 1, 1, 0644, true);
-        $queueShm = shmop_open($myPid + 2, 'c', 0644, 4);
-        shmop_write($queueShm, pack('V', 0), 0);
-
-        // Fork children
-        $tmpDir = sys_get_temp_dir();
-        $childMap = [];
+        // Fork 9 children, parent takes last chunk
+        $sockets = [];
 
         for ($w = 0; $w < self::WORKERS - 1; $w++) {
-            $tmpFile = "{$tmpDir}/p100m_{$myPid}_{$w}";
+            $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            stream_set_chunk_size($pair[0], $packedSize);
+            stream_set_chunk_size($pair[1], $packedSize);
+
             $pid = pcntl_fork();
             if ($pid === 0) {
+                // Child
+                fclose($pair[0]);
                 \set_error_handler(fn() => true); \proc_nice(-20); \restore_error_handler();
+
                 $buckets = array_fill(0, $pathCount, '');
                 $fh = fopen($inputPath, 'rb');
                 stream_set_read_buffer($fh, 0);
-
-                while (($ci = self::nextChunk($queueShm, $sem)) !== -1) {
-                    self::parseChunk($fh, $boundaries[$ci], $boundaries[$ci + 1], $pathIds, $dateIdChars, $buckets);
-                }
+                self::parseRange($fh, $boundaries[$w], $boundaries[$w + 1], $pathIds, $dateIdChars, $buckets);
                 fclose($fh);
 
-                $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
-                file_put_contents($tmpFile, pack('v*', ...$counts));
+                // Convert buckets to flat counts
+                $counts = array_fill(0, $cellTotal, 0);
+                $base = 0;
+                foreach ($buckets as $bucket) {
+                    if ($bucket !== '') {
+                        foreach (array_count_values(unpack('v*', $bucket)) as $did => $n) {
+                            $counts[$base + $did] += $n;
+                        }
+                    }
+                    $base += $dateCount;
+                }
+
+                fwrite($pair[1], pack('v*', ...$counts));
+                fclose($pair[1]);
                 exit(0);
             }
-            $childMap[$pid] = $tmpFile;
+
+            // Parent
+            fclose($pair[1]);
+            $sockets[$w] = $pair[0];
         }
 
-        // Parent also parses
+        // Parent parses last chunk
         \set_error_handler(fn() => true); \proc_nice(-20); \restore_error_handler();
+
         $buckets = array_fill(0, $pathCount, '');
         $fh = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
-
-        while (($ci = self::nextChunk($queueShm, $sem)) !== -1) {
-            self::parseChunk($fh, $boundaries[$ci], $boundaries[$ci + 1], $pathIds, $dateIdChars, $buckets);
-        }
+        $lastW = self::WORKERS - 1;
+        self::parseRange($fh, $boundaries[$lastW], $boundaries[$lastW + 1], $pathIds, $dateIdChars, $buckets);
         fclose($fh);
 
-        $counts = self::bucketsToCounts($buckets, $pathCount, $dateCount);
+        // Convert parent's buckets to counts
+        $counts = array_fill(0, $cellTotal, 0);
+        $base = 0;
+        foreach ($buckets as $bucket) {
+            if ($bucket !== '') {
+                foreach (array_count_values(unpack('v*', $bucket)) as $did => $n) {
+                    $counts[$base + $did] += $n;
+                }
+            }
+            $base += $dateCount;
+        }
+        unset($buckets);
 
-        // Merge children
-        $pending = count($childMap);
-        while ($pending > 0) {
-            $pid = pcntl_wait($status, WNOHANG);
-            if ($pid <= 0) {
-                $pid = pcntl_wait($status);
+        // Collect children via stream_select
+        $remaining = count($sockets);
+        while ($remaining > 0) {
+            $read = array_values($sockets);
+            $w = null;
+            $e = null;
+            stream_select($read, $w, $e, 10);
+
+            foreach ($read as $sock) {
+                $data = '';
+                while (strlen($data) < $packedSize) {
+                    $chunk = fread($sock, $packedSize - strlen($data));
+                    if ($chunk === false || $chunk === '') break;
+                    $data .= $chunk;
+                }
+
+                if (strlen($data) === $packedSize) {
+                    $childCounts = unpack('v*', $data);
+                    $k = 1;
+                    for ($j = 0; $j < $cellTotal; $j++, $k++) {
+                        if ($v = $childCounts[$k]) {
+                            $counts[$j] += $v;
+                        }
+                    }
+                }
+
+                fclose($sock);
+                $key = array_search($sock, $sockets, true);
+                if ($key !== false) {
+                    unset($sockets[$key]);
+                }
+                $remaining--;
             }
-            $tmpFile = $childMap[$pid];
-            $wCounts = unpack('v*', file_get_contents($tmpFile));
-            unlink($tmpFile);
-            $j = 0;
-            foreach ($wCounts as $v) {
-                $counts[$j] += $v;
-                $j++;
-            }
-            $pending--;
         }
 
-        // Clean up shared memory
-        shmop_delete($queueShm);
-        sem_remove($sem);
+        // Reap children
+        while (\pcntl_wait($status) > 0) {}
 
         self::writeJson($outputPath, $counts, $paths, $dates, $dateCount);
     }
 
-    private static function nextChunk($queueShm, $sem): int
-    {
-        sem_acquire($sem);
-        $idx = unpack('V', shmop_read($queueShm, 0, 4))[1];
-        if ($idx >= self::NUM_CHUNKS) {
-            sem_release($sem);
-            return -1;
-        }
-        shmop_write($queueShm, pack('V', $idx + 1), 0);
-        sem_release($sem);
-        return $idx;
-    }
-
-    private static function parseChunk($fh, $start, $end, $pathIds, $dateIdChars, &$buckets): void
+    private static function parseRange($fh, $start, $end, $pathIds, $dateIdChars, &$buckets): void
     {
         fseek($fh, $start);
         $remaining = $end - $start;
@@ -225,9 +231,17 @@ final class Parser
             }
 
             $p = 25;
-            $fence = $lastNl - 800;
+            $fence = $lastNl - 1010;
 
             while ($p < $fence) {
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
+
+                $sep = strpos($chunk, ',', $p);
+                $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
+                $p = $sep + 52;
+
                 $sep = strpos($chunk, ',', $p);
                 $buckets[$pathIds[substr($chunk, $p, $sep - $p)]] .= $dateIdChars[substr($chunk, $sep + 3, 8)];
                 $p = $sep + 52;
@@ -267,19 +281,6 @@ final class Parser
                 $p = $sep + 52;
             }
         }
-    }
-
-    private static function bucketsToCounts(&$buckets, $pathCount, $dateCount): array
-    {
-        $counts = array_fill(0, $pathCount * $dateCount, 0);
-        for ($s = 0; $s < $pathCount; $s++) {
-            if ($buckets[$s] === '') continue;
-            $base = $s * $dateCount;
-            foreach (array_count_values(unpack('v*', $buckets[$s])) as $did => $n) {
-                $counts[$base + $did] += $n;
-            }
-        }
-        return $counts;
     }
 
     private static function writeJson(
