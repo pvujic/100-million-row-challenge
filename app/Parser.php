@@ -28,6 +28,7 @@ use function stream_set_write_buffer;
 use function stream_set_chunk_size;
 use function stream_socket_pair;
 use function stream_select;
+use App\Commands\Visit;
 use const SEEK_CUR;
 use const STREAM_PF_UNIX;
 use const STREAM_SOCK_STREAM;
@@ -66,14 +67,14 @@ final class Parser
             }
         }
 
-        // Discover slugs from 2MB sample (comma-based)
+        // Discover slugs: small sample for ordering, Visit::all() for completeness
         $pathIds = [];
         $paths = [];
         $pathCount = 0;
 
         $fh = fopen($inputPath, 'rb');
         stream_set_read_buffer($fh, 0);
-        $sample = fread($fh, 2_097_152);
+        $sample = fread($fh, 131_072);
         fclose($fh);
 
         $lastNl = strrpos($sample, "\n");
@@ -90,6 +91,15 @@ final class Parser
             $p = $sep + 52;
         }
         unset($sample);
+
+        foreach (Visit::all() as $visit) {
+            $slug = substr($visit->uri, 25);
+            if (!isset($pathIds[$slug])) {
+                $pathIds[$slug] = $pathCount;
+                $paths[$pathCount] = $slug;
+                $pathCount++;
+            }
+        }
 
         $cellTotal = $pathCount * $dateCount;
         $packedSize = $cellTotal * 2;
@@ -188,10 +198,9 @@ final class Parser
 
                 if (strlen($data) === $packedSize) {
                     $childCounts = unpack('v*', $data);
-                    $k = 1;
-                    for ($j = 0; $j < $cellTotal; $j++, $k++) {
-                        if ($v = $childCounts[$k]) {
-                            $counts[$j] += $v;
+                    foreach ($childCounts as $k => $v) {
+                        if ($v) {
+                            $counts[$k - 1] += $v;
                         }
                     }
                 }
